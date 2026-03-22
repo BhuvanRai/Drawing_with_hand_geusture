@@ -2,6 +2,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+# -------- MODEL --------
 model_path = r"F:\Coding\project\Drawing_with_hand_geusture\hand_landmarker.task"
 
 BaseOptions = mp.tasks.BaseOptions
@@ -19,86 +20,114 @@ landmarker = HandLandmarker.create_from_options(options)
 
 cap = cv2.VideoCapture(1)
 
+# -------- STATE --------
 rectangles = []
-current_rect = None
-locked = False
+temp_rect = None
+
+draw_counter = 0
+release_counter = 0
+
+DRAW_THRESHOLD = 2
+RELEASE_THRESHOLD = 2
+
+alpha = 0.5   # smoothing
+l = 2      # gap
+threshold = 50
 
 
-# -------- NORMALIZE RECT --------
+# -------- HELPERS --------
+def is_fist(hand_landmarks):
+    # Check if index, middle, ring, pinky tips are closer to wrist than their PIP joints
+    for tip, pip in [(8, 6), (12, 10), (16, 14), (20, 18)]:
+        tip_dist = (hand_landmarks[tip].x - hand_landmarks[0].x)**2 + (hand_landmarks[tip].y - hand_landmarks[0].y)**2
+        pip_dist = (hand_landmarks[pip].x - hand_landmarks[0].x)**2 + (hand_landmarks[pip].y - hand_landmarks[0].y)**2
+        if tip_dist > pip_dist:
+            return False
+    return True
+
 def normalize(rect):
     x1, y1, x2, y2 = rect
     return min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)
 
 
-# -------- OVERLAP CHECK --------
-def is_overlap(r1, r2):
+def is_overlap(r1, r2, margin=0, area_thresh=0.1):
     x1, y1, x2, y2 = r1
     x3, y3, x4, y4 = r2
 
-    return not (x2 < x3 or x4 < x1 or y2 < y3 or y4 < y1)
+    # -------- EXPAND rectangles by margin --------
+    x1 -= margin
+    y1 -= margin
+    x2 += margin
+    y2 += margin
 
-l=2
-# -------- SNAP FUNCTION --------
-def snap_rect(new_rect, old_rect, threshold=20):
+    x3 -= margin
+    y3 -= margin
+    x4 += margin
+    y4 += margin
+
+    # -------- INTERSECTION --------
+    xi1 = max(x1, x3)
+    yi1 = max(y1, y3)
+    xi2 = min(x2, x4)
+    yi2 = min(y2, y4)
+
+    if xi2 <= xi1 or yi2 <= yi1:
+        return False  # no overlap
+
+    # -------- AREA CHECK --------
+    inter_area = (xi2 - xi1) * (yi2 - yi1)
+
+    area1 = (x2 - x1) * (y2 - y1)
+    area2 = (x4 - x3) * (y4 - y3)
+
+    min_area = min(area1, area2)
+
+    # -------- STRONG CONDITION --------
+    if inter_area / min_area > area_thresh:
+        return True
+
+    return False
+
+
+def snap_rect(new_rect, old_rect):
     x1, y1, x2, y2 = new_rect
     x3, y3, x4, y4 = old_rect
 
-    width = abs(x3 - x4)
-    height = abs(y3 - y4)
+    width = x2 - x1
+    height = y2 - y1
 
-    # ABOVE → inherit WIDTH
-    if (x1 - x3)**2 + (y1 - y4)**2 < threshold**2:
-        width = x4 - x3  # inherit
-        new_x1 = x3
-        new_x2 = x4
-
-        new_y2 = y4 - l
-        new_y1 = new_y2 - (y2 - y1)  # keep height
-
+    # BELOW → inherit WIDTH (top edge of new near bottom edge of old)
+    if (x1 - x3)**2 + (y1 - y4)**2 < threshold**2 or (x2 - x4)**2 + (y1 - y4)**2 < threshold**2:
+        new_x1, new_x2 = x3, x4
+        new_y1 = y4 + l
+        new_y2 = new_y1 + height
         return (new_x1, new_y1, new_x2, new_y2)
 
-
-    # BELOW → inherit WIDTH
-    if (x1 - x3)**2 + (y2 - y3)**2 < threshold**2:
-        width = x4 - x3
-        new_x1 = x3
-        new_x2 = x4
-
-        new_y1 = y3 + l
-        new_y2 = new_y1 + (y2 - y1)
-
+    # ABOVE → inherit WIDTH (bottom edge of new near top edge of old)
+    if (x1 - x3)**2 + (y2 - y3)**2 < threshold**2 or (x2 - x4)**2 + (y2 - y3)**2 < threshold**2:
+        new_x1, new_x2 = x3, x4
+        new_y2 = y3 - l
+        new_y1 = new_y2 - height
         return (new_x1, new_y1, new_x2, new_y2)
 
-
-    # LEFT → inherit HEIGHT
-    if (x2 - x3)**2 + (y1 - y3)**2 < threshold**2:
-        height = y4 - y3  # inherit
-        new_y1 = y3
-        new_y2 = y4
-
+    # LEFT → inherit HEIGHT (right edge of new near left edge of old)
+    if (x2 - x3)**2 + (y1 - y3)**2 < threshold**2 or (x2 - x3)**2 + (y2 - y4)**2 < threshold**2:
+        new_y1, new_y2 = y3, y4
         new_x2 = x3 - l
-        new_x1 = new_x2 - (x2 - x1)
-
+        new_x1 = new_x2 - width
         return (new_x1, new_y1, new_x2, new_y2)
 
-
-    # RIGHT → inherit HEIGHT
-    if (x1 - x4)**2 + (y1 - y3)**2 < threshold**2:
-        height = y4 - y3
-        new_y1 = y3
-        new_y2 = y4
-
+    # RIGHT → inherit HEIGHT (left edge of new near right edge of old)
+    if (x1 - x4)**2 + (y1 - y3)**2 < threshold**2 or (x1 - x4)**2 + (y2 - y4)**2 < threshold**2:
+        new_y1, new_y2 = y3, y4
         new_x1 = x4 + l
-        new_x2 = new_x1 + (x2 - x1)
-
+        new_x2 = new_x1 + width
         return (new_x1, new_y1, new_x2, new_y2)
 
     return None
 
 
 # -------- MAIN LOOP --------
-alpha = 0.7  # smoothing factor
-
 while True:
     ret, frame = cap.read()
     if not ret:
@@ -115,68 +144,79 @@ while True:
         h, w, _ = frame.shape
         hand = result.hand_landmarks[0]
 
-        # -------- GESTURES --------
-        thumb_up  = hand[4].y < hand[3].y
-        index_up  = hand[8].y < hand[6].y
-        middle_up = hand[12].y < hand[10].y
-        ring_up   = hand[16].y < hand[14].y
-        pinky_up  = hand[20].y < hand[18].y
+        # -------- POINTS --------
+        x1, y1 = int(hand[4].x * w), int(hand[4].y * h)
+        x2, y2 = int(hand[8].x * w), int(hand[8].y * h)
 
-        draw_mode = thumb_up and index_up
-        fist = not index_up and not middle_up and not ring_up and not pinky_up
+        # -------- DISTANCE --------
+        dist = ((x1 - x2)**2 + (y1 - y2)**2) ** 0.5
+
+        if dist > 40:
+            draw_counter += 1
+            release_counter = 0
+        else:
+            release_counter += 1
+            draw_counter = 0
+
+        draw_mode = draw_counter >= DRAW_THRESHOLD
 
         # -------- DRAW --------
         if draw_mode:
-            x1, y1 = int(hand[4].x * w), int(hand[4].y * h)
-            x2, y2 = int(hand[8].x * w), int(hand[8].y * h)
-
-            if current_rect is None:
-                current_rect = (x1, y1, x2, y2)
+            if temp_rect is None:
+                temp_rect = (x1, y1, x2, y2)
             else:
-                px1, py1, px2, py2 = current_rect
-                current_rect = (
+                px1, py1, px2, py2 = temp_rect
+                temp_rect = (
                     int(alpha * px1 + (1 - alpha) * x1),
                     int(alpha * py1 + (1 - alpha) * y1),
                     int(alpha * px2 + (1 - alpha) * x2),
                     int(alpha * py2 + (1 - alpha) * y2),
                 )
 
-        # -------- LOCK RECT --------
-        if fist and current_rect is not None and not locked:
+        # -------- COMMIT --------
+        if release_counter >= RELEASE_THRESHOLD and temp_rect is not None:
 
-            current_rect = normalize(current_rect)
+            nx1, ny1, nx2, ny2 = normalize(temp_rect)
+            
+            # Compensate for fingers closing during the commit motion
+            pad = 20 
+            new_rect = (nx1 - pad, ny1 - pad, nx2 + pad, ny2 + pad)
 
-            # SNAP FIRST
+            # SNAP
             for rect in rectangles:
-                snapped = snap_rect(current_rect, rect)
+                snapped = snap_rect(new_rect, rect)
                 if snapped is not None:
-                    current_rect = normalize(snapped)
+                    new_rect = normalize(snapped)
                     break
 
-            # CHECK OVERLAP
+            # OVERLAP CHECK
             overlap = False
             for rect in rectangles:
-                if is_overlap(current_rect, rect):
+                if is_overlap(new_rect, rect):
                     overlap = True
                     break
 
-            # STORE
             if not overlap:
-                rectangles.append(current_rect)
+                rectangles.append(new_rect)
 
-            current_rect = None
-            locked = True
+            temp_rect = None
 
-        if not fist:
-            locked = False
+        # -------- FIST DELETE --------
+        if is_fist(hand):
+            hx, hy = int(hand[9].x * w), int(hand[9].y * h)
+            # Remove any rectangle containing the hand midpoint
+            rectangles = [
+                r for r in rectangles 
+                if not (r[0] < hx < r[2] and r[1] < hy < r[3])
+            ]
 
     # -------- DRAW STORED --------
     for x1, y1, x2, y2 in rectangles:
         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
-    # -------- DRAW CURRENT --------
-    if current_rect is not None:
-        x1, y1, x2, y2 = normalize(current_rect)
+    # -------- DRAW TEMP --------
+    if temp_rect is not None:
+        x1, y1, x2, y2 = normalize(temp_rect)
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
     cv2.imshow("Hand Drawing System", frame)
